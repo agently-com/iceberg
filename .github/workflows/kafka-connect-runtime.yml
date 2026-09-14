@@ -1,0 +1,74 @@
+# Builds the Apache Iceberg Kafka Connect runtime distribution (the plugin zip Kafka Connect
+# loads) from a release tag of apache/iceberg and attaches it to a GitHub Release of this fork.
+#
+# Apache publishes no such zip anywhere — Maven Central carries `iceberg-kafka-connect` (the
+# library) but not `iceberg-kafka-connect-runtime`, and the upstream GitHub releases carry no
+# assets; the docs say the zip "is created as part of the Iceberg build". The agently-teams
+# monorepo fetches the Release asset by sha256 (`MODULE.bazel`, `http_file`), so upgrading
+# Iceberg is: run this workflow on the new tag, bump the version and the hash there.
+#
+# The fork carries nothing but this file on its own branch; `main` follows upstream untouched.
+# Context: agently-com/agently-teams#1181 (the pipeline runtime) and #1186 (the dev runtime).
+name: kafka-connect-runtime
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Iceberg version — the apache-iceberg-<version> tag of apache/iceberg"
+        required: true
+        default: "1.11.0"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out apache/iceberg at the release tag
+        uses: actions/checkout@v4
+        with:
+          repository: apache/iceberg
+          ref: refs/tags/apache-iceberg-${{ inputs.version }}
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      # The build reads its version from version.txt when present (otherwise from git-version
+      # over the tag); pinning it here makes the artifact name independent of the checkout.
+      - name: Pin the project version
+        run: echo "${{ inputs.version }}" > version.txt
+
+      # Only the Kafka Connect modules are configured: an empty Spark/Flink list keeps the
+      # configuration phase to the modules the runtime needs.
+      - name: Build the runtime distribution
+        run: |
+          ./gradlew --no-daemon \
+            -DsparkVersions= -DflinkVersions= -DkafkaVersions=3 \
+            :iceberg-kafka-connect:iceberg-kafka-connect-runtime:distZip -x test
+
+      - name: Checksum
+        id: checksum
+        run: |
+          cd kafka-connect/kafka-connect-runtime/build/distributions
+          ls -l
+          sha256sum iceberg-kafka-connect-runtime-${{ inputs.version }}.zip | tee SHA256SUMS
+          echo "sha256=$(cut -d' ' -f1 SHA256SUMS)" >> "$GITHUB_OUTPUT"
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="kafka-connect-runtime-${{ inputs.version }}"
+          DIST=kafka-connect/kafka-connect-runtime/build/distributions
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" \
+            --title "Iceberg Kafka Connect runtime ${{ inputs.version }}" \
+            --notes "Built from apache/iceberg tag apache-iceberg-${{ inputs.version }} by the kafka-connect-runtime workflow (run ${{ github.run_id }}), JDK 21, \`distZip -x test\`. sha256: ${{ steps.checksum.outputs.sha256 }}" \
+            "$DIST/iceberg-kafka-connect-runtime-${{ inputs.version }}.zip" \
+            "$DIST/SHA256SUMS"
